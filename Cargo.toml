@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 bpe = "0.2.0"
 bpe-tokenizer = "0.1.4"
+dashmap = {version = "6.1.0", features = ["rayon"] }
 flate2 = "1.0.35"
 indicatif = "0.17.9"
 pyo3 = { version = "0.23.4", features = ["extension-module"] }

@@ -4,12 +4,13 @@ use std::borrow::Borrow;
 use std::fmt::Write;
 use std::fs::File;
 use std::io::{Result as IOResult,BufReader,BufRead};
-use std::collections::HashMap;
+use std::collections::{HashMap,HashSet};
 
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use rayon::prelude::*;
+use dashmap::DashMap;
 
 use pyo3::prelude::*;
 use pyo3::exceptions::{PyUnicodeDecodeError};
@@ -86,6 +87,8 @@ impl BPEEncoder {
     }
 }
 
+type InvertedIndex = DashMap<(u32, u32), HashSet<usize>>;
+
 #[pyclass]
 pub struct BPE {
     encoder: BPEEncoder
@@ -96,59 +99,97 @@ impl BPE {
     pub fn count_pairs(
         chunks: &[Vec<u32>],
         chunk_size: Option<usize>
-    ) -> HashMap<(u32, u32), usize> {
+    ) -> InvertedIndex {
         let chunk_size = chunk_size.unwrap_or(1_000);
         let stats = (0..chunks.len()).into_par_iter().step_by(chunk_size).map(|start_idx| {
             let end_idx = (start_idx + chunk_size).min(chunks.len());
-            let mut hm = HashMap::new();
-            chunks[start_idx..end_idx].iter().for_each(|chunk| {
+            let mut hm = DashMap::new();
+            for doc_id in start_idx..end_idx {
+                let chunk = &chunks[doc_id];
                 chunk.windows(2).for_each(|pair| { 
                     let p = (pair[0], pair[1]);
-                    *hm.entry(p).or_insert(0) += 1;
+                    let e = hm.entry(p);
+                    e.or_insert_with(||HashSet::new()).insert(doc_id);
                 });
-            });
+            }
             hm
-        }).reduce(||HashMap::new(), |mut hm1, hm2| {
+        }).reduce(||DashMap::new(), |mut hm1, hm2| {
             hm2.into_iter().for_each(|(k, v)| {
-                let e = hm1.entry(k).or_insert(0); 
-                *e = *e + v;
+                if !hm1.contains_key(&k) {
+                    hm1.insert(k, v);
+                } else {
+                    let mut v1 = hm1.entry(k).or_insert_with(||HashSet::new()); 
+                    v.into_iter().for_each(|v_i| {
+                        v1.insert(v_i);
+                    });
+                }
             });
             hm1
         });
         stats
     }
 
+    fn add_chunk_to_index(
+        inverted_idx: &InvertedIndex, 
+        doc_id: usize, 
+        chunk: &[u32]
+    ) {
+        chunk.par_iter().zip(chunk.par_iter().skip(1)).for_each(|pair| {
+            let p = (*pair.0, *pair.1);
+            let mut e = inverted_idx.entry(p).or_insert_with(|| HashSet::new());
+            e.insert(doc_id);
+        });
+    }
+
+    fn remove_chunk_from_index(
+        inverted_idx: &InvertedIndex, 
+        doc_id: usize, 
+        chunk: &[u32]
+    ) {
+        chunk.par_iter().zip(chunk.par_iter().skip(1)).for_each(|pair| {
+            if let Some(mut hs) = inverted_idx.get_mut(&(*pair.0, *pair.1)) {
+                hs.remove(&doc_id);
+            }
+        });
+    }
+
     pub fn merge(
+        inverted_idx: &mut InvertedIndex,
         chunks: &mut [Vec<u32>],
+        doc_ids: &HashSet<usize>,
         pair: (u32, u32),
         new_idx: u32
     ) {
-        chunks.par_iter_mut().for_each(|mut chunk| {
-            let mut buffer = Vec::with_capacity(0);
-            let mut mutated = false;
+        let merged: Vec<_> = doc_ids.par_iter().map(|doc_id| {
+            let chunk: &[u32] = &chunks[*doc_id];
+            let mut buffer = Vec::with_capacity(chunk.len());
             // Skip tells the iterator to skip the next token because it was collapsed
             let mut skip = false;
-            chunk.windows(2).enumerate().for_each(|(i, p)| {
+            chunk.windows(2).for_each(|p| {
                 if !skip {
                     if p[0] == pair.0 && p[1] == pair.1 {
-                        if !mutated {
-                            buffer.extend_from_slice(&chunk[0..i]);
-                        }
-                        mutated = true;
                         skip = true;
                         buffer.push(new_idx);
-                    } else if mutated {
+                    } else {
                         buffer.push(p[0]);
                     }
                 } else {
                     skip = false;
                 }
             });
+            (*doc_id, buffer)
+        }).collect();
 
-            if mutated {
-                std::mem::swap(&mut buffer, &mut chunk);
-            }
+        merged.par_iter().for_each(|(doc_id, new_buff)| {
+            let chunk = &chunks[*doc_id];
+            BPE::remove_chunk_from_index(inverted_idx, *doc_id, chunk);
+            BPE::add_chunk_to_index(inverted_idx, *doc_id, new_buff.as_slice());
         });
+
+        merged.into_iter().for_each(|(doc_id, mut new_buff)| {
+            std::mem::swap(&mut new_buff, &mut chunks[doc_id]);
+        });
+
     }
 
     fn convert_text_to_chunks(
@@ -171,10 +212,17 @@ impl BPE {
 
         // Insert the original 256 characters into the dictionary
         let mut dictionary: Vec<Vec<u32>> = (0..256u32).map(|c| vec![c]).collect();
+        let mut inverted_idx = BPE::count_pairs(&chunks, None);
         while dictionary.len() < max_vocab {
-            let counts = BPE::count_pairs(&chunks, None);
-            if let Some((pair, _cnt)) = counts.iter().max_by_key(|(_pair, count)| *count) {
-                BPE::merge(&mut chunks, *pair, dictionary.len() as u32);
+            let best_key = inverted_idx.par_iter()
+                .max_by_key(|kv| kv.value().len())
+                .map(|kv| {
+                    let (k, v) = kv.pair();
+                    (k.clone(), v.clone())
+                });
+
+            if let Some((pair, doc_ids)) = best_key {
+                BPE::merge(&mut inverted_idx, &mut chunks, &doc_ids, pair, dictionary.len() as u32);
                 dictionary.push(vec![pair.0, pair.1]);
                 pb.inc(1);
             }
