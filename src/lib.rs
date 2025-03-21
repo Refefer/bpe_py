@@ -1,14 +1,11 @@
 mod progress;
 
-use std::borrow::Borrow;
 use std::fmt::Write;
 use std::fs::File;
 use std::io::{Result as IOResult,BufReader,BufRead};
 use std::collections::{HashMap,HashSet};
 
-use flate2::Compression;
 use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
 use rayon::prelude::*;
 use dashmap::DashMap;
 
@@ -17,28 +14,61 @@ use pyo3::exceptions::{PyUnicodeDecodeError};
 
 use crate::progress::CLProgressBar;
 
-pub fn open_file_for_reading(path: &str) -> IOResult<Box<dyn BufRead>> {
+/**
+ * Reads a corpus from disk.  It handles gzip versus uncompressed natively.
+ *
+ */
+fn read_corpus(path: &str) -> IOResult<Vec<String>> {
     let f = File::open(path)?;
-
     let f = BufReader::new(f);
-    let result: Box<dyn BufRead> = if path.ends_with(".gz") {
+    let mut corpus = Vec::new();
+    if path.ends_with(".gz") {
         let decoder = BufReader::new(GzDecoder::new(f));
-        Box::new(decoder)
+        for line in decoder.lines() {
+            let line = line?;
+            corpus.push(line);
+        }
     } else {
-        Box::new(f)
+        for line in f.lines() {
+            let line = line?;
+            corpus.push(line);
+        }
     };
-    Ok(result)
+    Ok(corpus)
 }
 
 type Vocab<A> = Vec<Vec<A>>;
+
+/**
+ * The main magic.  It encodes and decodes strings from a learned BPE vocabulary.
+ * */
 struct BPEEncoder {
+    /// Code points for underlying text.
     vocab: Vocab<u32>,
+
+    /// Maps vectors of characters to codepoints
     lookup: HashMap<Vec<u8>, u32>,
-    max_key_len: usize
+
+    /// Encoding takes advantage of trying to maximally match a sequence by starting at the longest
+    /// potential sequence.
+    max_key_len: [usize; 256]
 }
 
 impl BPEEncoder {
-    pub fn decode_codepoint(vocab: &Vocab<u32>, codepoint: u32, into: &mut Vec<u8>) {
+    /** 
+     * Decodes a codepoint into its original representation.
+     */
+    pub fn decode_codepoint(
+        // Learned vocabulary
+        vocab: &Vocab<u32>, 
+
+        // Codepoint
+        codepoint: u32, 
+
+        // Where to store the decoded string.  It does _not_ clear the vector before writing,
+        // allowing the user to stream tokens into it.
+        into: &mut Vec<u8>
+    ) {
         if codepoint < 256 {
             into.push(codepoint as u8);
         } else {
@@ -48,24 +78,37 @@ impl BPEEncoder {
         }
     }
 
-    pub fn new(vocab: Vocab<u32>) -> BPEEncoder {
+    /**
+     * Creates a new BPEEncoder from a given vocab.
+     */
+    pub fn new(
+        vocab: Vocab<u32>
+    ) -> BPEEncoder {
         let mut lookup = HashMap::new();
-        let mut max_key_len = 0;
+        let mut max_key_len = [1; 256];
         for i in 0..vocab.len() {
             let mut key = Vec::new();
             BPEEncoder::decode_codepoint(&vocab, i as u32, &mut key);
-            max_key_len = max_key_len.max(key.len());
+            let c = key[0] as usize;
+            max_key_len[c] = max_key_len[c].max(key.len());
             lookup.insert(key, i as u32);
         }
         BPEEncoder { vocab, lookup, max_key_len }
     }
 
-    pub fn encode(&self, sequence: &[u8]) -> Vec<u32> {
+    /**
+     * Given as sequence of characters, encode it into a set of 32bit codepoints.
+     */
+    pub fn encode(
+        &self, 
+        sequence: &[u8]
+    ) -> Vec<u32> {
         let mut output = Vec::new();
         let mut i = 0;
-        let s_l = sequence.len();
-        while i < s_l {
-            let max_j = (s_l - i).min(self.max_key_len+1);
+        let s_len = sequence.len();
+        while i < s_len {
+            let max_key_len = self.max_key_len[sequence[i] as usize];
+            let max_j = (s_len - i).min(max_key_len + 1);
             for j in (1..max_j+1).rev() {
                 let end_point = i + j;
                 let candidate = &sequence[i..end_point]; 
@@ -78,17 +121,36 @@ impl BPEEncoder {
         }
         output
     }
-    pub fn decode(&self, sequence: &[u32]) -> Vec<u8> {
+
+    /**
+     * Decodes a list of codepoints into the original underlying sequence.
+     */
+    pub fn decode(
+        &self, 
+        sequence: &[u32]
+    ) -> Vec<u8> {
         let mut buff = Vec::new();
         for s in sequence {
             BPEEncoder::decode_codepoint(&self.vocab, *s, &mut buff)
         }
         buff
     }
+
+    fn len(&self) -> usize {
+        self.vocab.len()
+    }
 }
 
+/// To speed up replacement, we create an inverted index which maps
+/// pairs of sequences to the corpus line.
 type InvertedIndex = DashMap<(u32, u32), HashSet<usize>>;
 
+/**
+ * BPE provides three main capabilities:
+ * 1. Learn a byte-pair encoding from a corpus.
+ * 2. Encode a string of text into a byte-pair encoded representation.
+ * 3. Decode a byte-pair encoded representation back into original sequence
+ */
 #[pyclass]
 pub struct BPE {
     encoder: BPEEncoder
@@ -96,14 +158,22 @@ pub struct BPE {
 
 impl BPE {
 
-    pub fn count_pairs(
+    /**
+     * Counts codepoints in a corpus by pairs, creating an inverted index.
+     */
+    fn count_pairs(
+
+        // Corpus to count
         chunks: &[Vec<u32>],
+
+        // Number of chunks to perform in parallel.  
         chunk_size: Option<usize>
+
     ) -> InvertedIndex {
         let chunk_size = chunk_size.unwrap_or(1_000);
         let stats = (0..chunks.len()).into_par_iter().step_by(chunk_size).map(|start_idx| {
             let end_idx = (start_idx + chunk_size).min(chunks.len());
-            let mut hm = DashMap::new();
+            let hm = DashMap::new();
             for doc_id in start_idx..end_idx {
                 let chunk = &chunks[doc_id];
                 chunk.windows(2).for_each(|pair| { 
@@ -113,7 +183,7 @@ impl BPE {
                 });
             }
             hm
-        }).reduce(||DashMap::new(), |mut hm1, hm2| {
+        }).reduce(||DashMap::new(), |hm1, hm2| {
             hm2.into_iter().for_each(|(k, v)| {
                 if !hm1.contains_key(&k) {
                     hm1.insert(k, v);
@@ -129,6 +199,13 @@ impl BPE {
         stats
     }
 
+    fn __len__(&self) -> usize {
+        self.encoder.len()
+    }
+
+    /**
+     *  Adds a document to the inverted index.
+     */
     fn add_chunk_to_index(
         inverted_idx: &InvertedIndex, 
         doc_id: usize, 
@@ -141,6 +218,9 @@ impl BPE {
         });
     }
 
+    /**
+     *  Removes a document to the inverted index.
+     */
     fn remove_chunk_from_index(
         inverted_idx: &InvertedIndex, 
         doc_id: usize, 
@@ -153,6 +233,9 @@ impl BPE {
         });
     }
 
+    /**
+     * Merges two codepoints into a new codepoint and updates the inverted index.
+     */
     pub fn merge(
         inverted_idx: &mut InvertedIndex,
         chunks: &mut [Vec<u32>],
@@ -192,6 +275,9 @@ impl BPE {
 
     }
 
+    /**
+     * Converts sequences of strings into a sequence of u8s
+     */
     fn convert_text_to_chunks(
         text: Vec<String>
     ) -> Vec<Vec<u32>> {
@@ -200,6 +286,10 @@ impl BPE {
         }).collect()
     }
 
+    /**
+     * Main algorithm for learning BPE.  It iteratively takes pairs of codepoints and merges the
+     * most frequence ones together.  It performs this up until max_vocab size.
+     */
     fn learn_vocab(
         text: Vec<String>,
         max_vocab: usize
@@ -207,13 +297,18 @@ impl BPE {
         
         let pb = CLProgressBar::new(max_vocab as u64 - 256, true);
         pb.update_message(|msg| { write!(msg, "Learning Vocab...").expect("Should never hit"); });
+
         // Convert string lines into characters
         let mut chunks = BPE::convert_text_to_chunks(text);
 
         // Insert the original 256 characters into the dictionary
         let mut dictionary: Vec<Vec<u32>> = (0..256u32).map(|c| vec![c]).collect();
         let mut inverted_idx = BPE::count_pairs(&chunks, None);
+
+        // Until we've learned the maximum vocab size, keep performing
         while dictionary.len() < max_vocab {
+            // This linear scan of the best pairs is one of the bottlenecks we run into.
+            // There is likely a faster way to do this but haven't thought it through enough :)
             let best_key = inverted_idx.par_iter()
                 .max_by_key(|kv| kv.value().len())
                 .map(|kv| {
@@ -236,6 +331,9 @@ impl BPE {
 #[pymethods]
 impl BPE {
     
+    /**
+     * Learns a new BPE encoder from a corpus.
+     */
     #[staticmethod]
     pub fn learn_from_corpus(
         text: Vec<String>,
@@ -246,6 +344,9 @@ impl BPE {
         BPE { encoder }
     }
 
+    /**
+     * Constructs a new encoder based on a previously learned vocabulary
+     */
     #[staticmethod]
     pub fn load_from_vocab(
         vocab: Vocab<u32>,
@@ -254,33 +355,60 @@ impl BPE {
         BPE { encoder }
     }
 
-
+    /**
+     * Returns the compression table
+     */
     pub fn vocab(&self) -> Vec<Vec<u32>> {
         self.encoder.vocab.clone()
     }
 
-    /*
+    /**
+     * Learns a new BPE encoder from a corpus stored on disk.
+     */
     #[staticmethod]
     pub fn learn_from_file(
-        path: String
-    ) -> IOResult<BPE> {
-        let s = open_file_for_reading(path)?;
-        BPE { bpe: vocab }
+        path: &str,
+        max_vocab: usize
+    ) -> PyResult<BPE> {
+        let text = read_corpus(&path)?;
+        let vocab = BPE::learn_vocab(text, max_vocab);
+        let encoder = BPEEncoder::new(vocab);
+        Ok(BPE { encoder })
     }
-    */
 
+    /**
+     * Encodes a string into a BPE encoded vector
+     */
     pub fn encode_str(&self, input: &str) -> Vec<u32> {
         self.encoder.encode(input.as_bytes())
     }
 
-    pub fn encode_array(&self, input: Vec<u8>) -> Vec<u32> {
+    /**
+     * Encodes a list of string into a BPE encoded vector.
+     */
+    pub fn encode_strs(&self, input: Vec<String>) -> Vec<Vec<u32>> {
+        input.into_par_iter().map(|s| {
+            self.encoder.encode(s.as_bytes())
+        }).collect()
+    }
+
+    /**
+     * Encodes a byte array into a BPE encoded vector.
+     */
+    pub fn encode_byte_array(&self, input: Vec<u8>) -> Vec<u32> {
         self.encoder.encode(input.as_slice())
     }
 
+    /**
+     * Decodes a BPE vector into a bytearray
+     */
     pub fn decode_to_bytes(&self, input: Vec<u32>) -> Vec<u8> {
         self.encoder.decode(input.as_slice())
     }
 
+    /**
+     * Decodes a BPE vector into a string
+     */
     pub fn decode_to_str(&self, input: Vec<u32>) -> PyResult<String> {
         let sequence = self.encoder.decode(input.as_slice());
         match std::str::from_utf8(sequence.as_slice()) {
